@@ -9,3 +9,5 @@ redis
 python-dotenv
 gunicorn
 Flask>=2.0
+regex
+pandas
