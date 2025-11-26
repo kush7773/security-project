@@ -1,4 +1,7 @@
-boto3
+functions-framework==3.*
+google-cloud-storage
+google-cloud-firestore
 scikit-learn
 joblib
-pandas
+numpy
+scipy

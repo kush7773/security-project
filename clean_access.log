@@ -1,11 +1,5 @@
-192.168.0.195 - - [30/Oct/2025:17:30:56 +0530] "GET / HTTP/1.1" 200 409 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:30:56 +0530] "GET /favicon.ico HTTP/1.1" 404 197 "http://192.168.0.201/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:03 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:03 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:04 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:04 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:04 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:15 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:15 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:15 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-192.168.0.195 - - [30/Oct/2025:17:31:15 +0530] "GET / HTTP/1.1" 304 0 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+192.168.1.5 - - [26/Nov/2025:10:00:00 +0000] "GET /index.php HTTP/1.1" 200 1234
+192.168.1.5 - - [26/Nov/2025:10:00:05 +0000] "GET /about.html HTTP/1.1" 200 2345
+192.168.1.6 - - [26/Nov/2025:10:00:10 +0000] "GET /contact.php HTTP/1.1" 200 3456
+192.168.1.7 - - [26/Nov/2025:10:00:15 +0000] "GET /css/style.css HTTP/1.1" 200 4567
+192.168.1.5 - - [26/Nov/2025:10:00:20 +0000] "GET /js/app.js HTTP/1.1" 200 5678
