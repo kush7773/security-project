@@ -1,1 +1,1 @@
-web: python -m functions_framework --target=log_ingestion_api --source=main.py --signature-type=http
+web: python -m functions_framework --target=log_ingestion_api --source=main.py --signature-type=http --port=$PORT
