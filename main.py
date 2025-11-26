@@ -4,405 +4,303 @@ import re
 import time
 import json
 import math
-import joblib
-import logging
-import traceback
+from collections import deque, defaultdict
 from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from pathlib import Path
 
 from flask import Flask, request, jsonify
 
+import joblib
 import numpy as np
 
-# Optional Redis support (recommended for multi-instance deployments)
-try:
-    import redis
-except Exception:
-    redis = None
+# ---- Config ----
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
+LOG_OUTPUT = os.environ.get("DETECTION_LOG", "/app/data/detections.log")
+ANOMALY_THRESHOLD = float(os.environ.get("ANOMALY_THRESHOLD", "0.5"))  # higher = more anomalous
+RATE_WINDOW_SECONDS = int(os.environ.get("RATE_WINDOW_SECONDS", "60"))  # sliding window for request counts
+RATE_THRESHOLD_PER_MIN = int(os.environ.get("RATE_THRESHOLD_PER_MIN", "100"))  # for API abuse tests
+FAILED_LOGIN_WINDOW = 300  # seconds
+FAILED_LOGIN_THRESHOLD = 10
 
-# --- Configuration ---
-PORT = int(os.environ.get("PORT", "8080"))
-REDIS_URL = os.environ.get("REDIS_URL")  # e.g. redis://:password@host:6379/0
-USE_REDIS = (redis is not None) and (REDIS_URL is not None)
+# ---- Load models (if present) ----
+tfidf = None
+pca = None
+scaler = None
+isof = None
 
-# Thresholds (tune these for your environment)
-BRUTE_FORCE_WINDOW_S = 60 * 5         # 5 minutes
-BRUTE_FORCE_FAILS_THRESHOLD = 10      # e.g., 10 failed logins in window -> suspicious
-API_RATE_WINDOW_S = 60                # per minute
-API_RATE_THRESHOLD = 120              # requests per minute -> API abuse
-ANOMALY_SCORE_THRESHOLD = 0.5         # lower => more sensitive (IsolationForest gives negative/positive/score)
-IP_USERAGENT_VARIETY_THRESHOLD = 10   # too many different UA's from same IP in short time
-SUSPICIOUS_PAYLOAD_ENTROPY = 4.0
+def try_load_models():
+    global tfidf, pca, scaler, isof
+    try:
+        tfidf = joblib.load(os.path.join(MODEL_DIR, "tfidf_vectorizer.joblib"))
+    except Exception:
+        tfidf = None
+    try:
+        pca = joblib.load(os.path.join(MODEL_DIR, "pca.joblib"))
+    except Exception:
+        pca = None
+    try:
+        scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.joblib"))
+    except Exception:
+        scaler = None
+    try:
+        isof = joblib.load(os.path.join(MODEL_DIR, "isolation_forest.joblib"))
+    except Exception:
+        isof = None
 
-# Model file locations (pretrained)
-TFIDF_PATH = os.environ.get("TFIDF_PATH", "tfidf_vectorizer.joblib")
-PCA_PATH = os.environ.get("PCA_PATH", "pca.joblib")  # optional if you used PCA
-IF_PATH = os.environ.get("IF_PATH", "isolation_forest.joblib")
-SCALER_PATH = os.environ.get("SCALER_PATH", "scaler.joblib")
+try_load_models()
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("secapp")
+# ---- Signature rules (regex) ----
+SIG_RULES = {
+    "sql_injection": re.compile(r"(?:')|(?:--)|(/\*)|(\bUNION\b)|(\bSELECT\b.*\bFROM\b)|(\bOR\b\s+\d+=\d+)", re.IGNORECASE),
+    "xss": re.compile(r"<script\b|<\/script>|javascript:|onerror=|onload=", re.IGNORECASE),
+    "path_traversal": re.compile(r"\.\./|\.\.\\"),
+    "jndi_like": re.compile(r"\$\{.*jndi:.*\}", re.IGNORECASE),  # detection only: pattern match
+    "shell_meta": re.compile(r"[;|`$&<>\\\(\)\{\}]", re.IGNORECASE),
+    "ssrf_ip": re.compile(r"http://169\.254\.169\.254|169\.254\.169\.254"),
+    "long_uri": re.compile(r"\/\S{100,}"),  # very long URI
+    "sensitive_file": re.compile(r"(etc/passwd|/etc/shadow|wp-config\.php)", re.IGNORECASE),
+}
+
+# ---- In-memory state for behavioral features (per-IP queues) ----
+ip_windows = defaultdict(lambda: deque())  # deque of timestamps
+ip_failed_logins = defaultdict(lambda: deque())  # deque of timestamps for 401/403
+ip_unique_paths = defaultdict(lambda: set())  # unique URIs seen recently
+
+# housekeeping TTL
+MAX_WINDOW_KEEP = 3600  # keep 1 hour of timestamps at most
 
 app = Flask(__name__)
 
-# Persistent stores (Redis-backed if configured)
-if USE_REDIS:
-    r = redis.from_url(REDIS_URL)
-else:
-    r = None
-    # In-memory fallback (not shared across instances)
-    ip_failures = defaultdict(deque)      # ip -> deque of fail timestamps
-    ip_requests = defaultdict(deque)      # ip -> deque of request timestamps
-    ip_useragents = defaultdict(lambda: defaultdict(int))  # ip -> ua -> count
-    recent_events = deque(maxlen=10000)
-
-# --- Signature regexes (simplified / extend these) ---
-SIG_REGEXES = {
-    "sql_injection": re.compile(r"(?i)\b(union(\s+all)?\s+select|or\s+1=1|--\s|#\s|/\*.*\*/|sleep\(|benchmark\()", re.IGNORECASE),
-    "xss": re.compile(r"(?i)(<script\b|javascript:|onerror=|onload=|%3Cscript%3E)"),
-    "path_traversal": re.compile(r"(\.\./|\.\.\\)"),
-    "lfi": re.compile(r"(?i)(etc/passwd|proc/self/environ|/etc/shadow)"),
-    "rce_cmd": re.compile(r"(?i)(;|\|\||\&\&|\$(\(|\{)|`.*`)\s*(curl|wget|nc|bash|sh)\b"),
-    "log4shell": re.compile(r"(?i)\$\{jndi:(ldap|rmi|dns|iiop|corba):\/\/[^\s\}]+\}"),
-    "ssrf": re.compile(r"(?i)http:\/\/127\.0\.0\.1|http:\/\/localhost|http:\/\/169\.254\.169\.254"),
-    "file_upload_malicious": re.compile(r"(?i)\.(php|phtml|jsp|asp|aspx|exe|sh)$"),
-    # Add more rules as you need...
-}
-
-# Helper: compute entropy of a string
-def shannon_entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    probs = [float(s.count(c)) / len(s) for c in set(s)]
-    return -sum(p * math.log2(p) for p in probs if p > 0)
-
-# --- Model loading (if present) ---
-tfidf = None
-pca = None
-isof = None
-scaler = None
-
-def safe_load_models():
-    global tfidf, pca, isof, scaler
-    try:
-        if os.path.exists(TFIDF_PATH):
-            tfidf = joblib.load(TFIDF_PATH)
-            logger.info("Loaded TF-IDF vectorizer.")
-    except Exception:
-        logger.exception("Failed to load TF-IDF.")
-
-    try:
-        if os.path.exists(PCA_PATH):
-            pca = joblib.load(PCA_PATH)
-            logger.info("Loaded PCA.")
-    except Exception:
-        logger.info("No PCA loaded (optional).")
-
-    try:
-        if os.path.exists(IF_PATH):
-            isof = joblib.load(IF_PATH)
-            logger.info("Loaded IsolationForest.")
-    except Exception:
-        logger.exception("Failed to load IsolationForest.")
-
-    try:
-        if os.path.exists(SCALER_PATH):
-            scaler = joblib.load(SCALER_PATH)
-            logger.info("Loaded scaler.")
-    except Exception:
-        logger.info("No scaler loaded (optional).")
-
-
-safe_load_models()
-
-# --- Rate/behavior helpers ---
 def now_ts():
-    return int(time.time())
+    return time.time()
 
-def add_ip_failure(ip):
-    t = now_ts()
-    if r:
-        key = f"fail:{ip}"
-        r.lpush(key, t)
-        r.expire(key, BRUTE_FORCE_WINDOW_S + 10)
-    else:
-        dq = ip_failures[ip]
-        dq.append(t)
-        # prune old
-        cutoff = t - BRUTE_FORCE_WINDOW_S
-        while dq and dq[0] < cutoff:
-            dq.popleft()
+def cleanup_ip(ip):
+    # remove old entries to avoid memory growth
+    cutoff = now_ts() - MAX_WINDOW_KEEP
+    q = ip_windows[ip]
+    while q and q[0] < cutoff:
+        q.popleft()
+    f = ip_failed_logins[ip]
+    while f and f[0] < cutoff:
+        f.popleft()
+    # we keep ip_unique_paths cleared by time occasionally (not implemented for speed)
 
-def count_ip_failures(ip):
-    t = now_ts()
-    if r:
-        key = f"fail:{ip}"
-        return r.llen(key)
-    else:
-        dq = ip_failures[ip]
-        cutoff = t - BRUTE_FORCE_WINDOW_S
-        return sum(1 for ts in dq if ts >= cutoff)
+def add_request(ip, ts, path, status):
+    ip_windows[ip].append(ts)
+    if status in (401, 403):
+        ip_failed_logins[ip].append(ts)
+    ip_unique_paths[ip].add((path, int(ts // RATE_WINDOW_SECONDS)))  # coarse bucketing for uniqueness
+    cleanup_ip(ip)
 
-def add_ip_request(ip):
-    t = now_ts()
-    if r:
-        key = f"req:{ip}"
-        r.lpush(key, t)
-        r.expire(key, API_RATE_WINDOW_S + 10)
-    else:
-        dq = ip_requests[ip]
-        dq.append(t)
-        cutoff = t - API_RATE_WINDOW_S
-        while dq and dq[0] < cutoff:
-            dq.popleft()
+def compute_behavioral_features(ip):
+    ts = now_ts()
+    one_min_cutoff = ts - RATE_WINDOW_SECONDS
+    q = ip_windows[ip]
+    count_1m = sum(1 for t in q if t >= one_min_cutoff)
+    failed = ip_failed_logins[ip]
+    failed_5m = sum(1 for t in failed if t >= ts - FAILED_LOGIN_WINDOW)
+    # unique URIs seen in last minute
+    uniq_paths = len([p for p, bucket in ip_unique_paths[ip] if bucket >= int(one_min_cutoff // RATE_WINDOW_SECONDS)])
+    return {
+        "count_1m": count_1m,
+        "failed_5m": failed_5m,
+        "unique_paths_1m": uniq_paths,
+    }
 
-def count_ip_requests(ip):
-    t = now_ts()
-    if r:
-        key = f"req:{ip}"
-        return r.llen(key)
-    else:
-        dq = ip_requests[ip]
-        cutoff = t - API_RATE_WINDOW_S
-        return sum(1 for ts in dq if ts >= cutoff)
-
-def add_useragent(ip, ua):
-    t = now_ts()
-    if r:
-        key = f"ua:{ip}"
-        r.hincrby(key, ua, 1)
-        r.expire(key, API_RATE_WINDOW_S * 10)
-    else:
-        ip_useragents[ip][ua] += 1
-
-def ua_variety(ip):
-    if r:
-        key = f"ua:{ip}"
-        return len(r.hgetall(key))
-    else:
-        return len(ip_useragents[ip])
-
-# --- Feature extraction for ML ---
-def extract_features_from_log(line: str):
+def extract_basic_fields(log_line):
     """
-    Return a combined numeric feature vector for the log_line.
+    Expect log_line as combined log or JSON. We'll try to parse common formats.
+    Fallback: treat whole line as 'text'
+    Returns: dict with ip, ts (unix), method, path, status (int), user_agent, text
     """
-    # Basic numeric features
-    features = {}
-    features["len"] = len(line)
-    features["entropy"] = shannon_entropy(line)
-    features["digit_ratio"] = sum(ch.isdigit() for ch in line) / max(1, len(line))
-    features["nonalnum_ratio"] = sum(not ch.isalnum() for ch in line) / max(1, len(line))
-    # status code / response size extraction if present in typical log format
-    # Try to parse "HTTP status" and "size" patterns
-    m = re.search(r'"\s*(\d{3})\s+(\d+)', line)
+    ip = None
+    ts = now_ts()
+    method = None
+    path = None
+    status = None
+    user_agent = None
+
+    # If JSON input
+    try:
+        parsed = json.loads(log_line)
+        # if the input already JSON with keys
+        ip = parsed.get("ip") or parsed.get("remote_addr")
+        method = parsed.get("method")
+        path = parsed.get("path") or parsed.get("uri")
+        status = int(parsed.get("status")) if parsed.get("status") else None
+        user_agent = parsed.get("user_agent") or parsed.get("ua")
+        text = json.dumps(parsed)
+        return {"ip": ip or "0.0.0.0", "ts": ts, "method": method, "path": path or "/", "status": status or 0, "user_agent": user_agent or "-", "text": text}
+    except Exception:
+        pass
+
+    # Try common Apache combined log pattern: IP - - [date] "METHOD PATH HTTP/1.1" STATUS BYTES "Referer" "User-Agent"
+    m = re.match(r'(?P<ip>\S+) .* \[(?P<date>.*?)\] "(?P<method>\S+) (?P<path>\S+).*" (?P<status>\d{3}) .* "(?P<ref>.*?)" "(?P<ua>.*?)"', log_line)
     if m:
-        features["status"] = int(m.group(1))
-        features["size"] = int(m.group(2))
-    else:
-        features["status"] = 0
-        features["size"] = 0
-    return features
-
-def vectorize_for_model(line: str):
-    """
-    Returns a 1D numpy array feature vector combining numeric features + TF-IDF reduced.
-    """
-    numeric = extract_features_from_log(line)
-    numeric_arr = np.array([numeric["len"], numeric["entropy"], numeric["digit_ratio"],
-                            numeric["nonalnum_ratio"], numeric["status"], numeric["size"]],
-                           dtype=float).reshape(1, -1)
-    # TF-IDF part
-    tfidf_part = None
-    if tfidf is not None:
+        ip = m.group("ip")
+        method = m.group("method")
+        path = m.group("path")
+        status = int(m.group("status"))
+        user_agent = m.group("ua")
+        # parse date to timestamp if possible
         try:
-            tf = tfidf.transform([line])
-            if pca is not None:
-                tf_reduced = pca.transform(tf.toarray())
-            else:
-                # if no PCA, reduce by taking top-k features (or average) -> keep small
-                tf_reduced = tf.toarray()
-            tfidf_part = tf_reduced
+            ts = time.mktime(datetime.strptime(m.group("date"), "%d/%b/%Y:%H:%M:%S %z").timetuple())
         except Exception:
-            logger.exception("tfidf transform failed.")
-            tfidf_part = None
+            ts = now_ts()
+        return {"ip": ip, "ts": ts, "method": method, "path": path, "status": status, "user_agent": user_agent, "text": log_line}
 
-    if tfidf_part is not None:
-        # align shapes (if tf_reduced has many dims, try to reduce to something manageable)
-        # If tfidf_part has shape (1, n), we can concatenante
-        try:
-            combined = np.hstack([numeric_arr, tfidf_part])
-        except Exception:
-            # fallback: just use numeric
-            combined = numeric_arr
-    else:
-        combined = numeric_arr
+    # Fallback: minimal parse for lines like: "IP - - [date] "GET /path HTTP/1.1" 200 123"
+    m2 = re.match(r'(?P<ip>\S+).*"(?P<method>\S+) (?P<path>\S+).*" (?P<status>\d{3})', log_line)
+    if m2:
+        ip = m2.group("ip")
+        method = m2.group("method")
+        path = m2.group("path")
+        status = int(m2.group("status"))
+        return {"ip": ip, "ts": ts, "method": method, "path": path, "status": status, "user_agent": "-", "text": log_line}
 
-    if scaler is not None:
-        try:
-            combined = scaler.transform(combined)
-        except Exception:
-            pass
+    # final fallback
+    return {"ip": "0.0.0.0", "ts": ts, "method": None, "path": "/", "status": 0, "user_agent": "-", "text": log_line}
 
-    return combined.ravel()
+def signature_scan(text):
+    hits = []
+    for name, rx in SIG_RULES.items():
+        if rx.search(text):
+            hits.append(name)
+    return hits
 
-# --- Detection pipeline ---
-def detect_signatures(line: str):
-    matches = []
-    for name, rx in SIG_REGEXES.items():
-        if rx.search(line):
-            matches.append(name)
-    return matches
+def make_text_feature(text):
+    # transform with tfidf/pca if available; fall back to basic hashing features
+    if tfidf is None:
+        # fallback: length + token count + char entropy
+        length = len(text)
+        token_count = len(text.split())
+        # char entropy
+        freq = {}
+        for c in text:
+            freq[c] = freq.get(c, 0) + 1
+        ent = 0.0
+        total = len(text) or 1
+        import math
+        for v in freq.values():
+            p = v / total
+            ent -= p * math.log2(p)
+        return np.array([length, token_count, ent])
+    try:
+        vec = tfidf.transform([text])
+        if pca is not None:
+            # If pca expects dense
+            try:
+                red = pca.transform(vec.toarray())
+            except Exception:
+                red = pca.transform(vec)
+            return red.flatten()
+        else:
+            # reduce dimensionality by taking top-n word counts
+            arr = vec.toarray().flatten()
+            # keep first 50 or pad
+            n = min(50, len(arr))
+            res = np.zeros(50, dtype=float)
+            res[:n] = arr[:n]
+            return res
+    except Exception:
+        return np.array([len(text), len(text.split()), 0.0])
 
-def detect_behavior(ip: str, parsed):
-    """
-    parsed: dict containing parsed fields like path, status, method, user_agent etc.
-    returns list of behavioral alerts
-    """
-    alerts = []
-    add_ip_request(ip)
-    add_useragent(ip, parsed.get("user_agent", "unknown"))
+def predict_anomaly(feature_vector):
+    if isof is None or scaler is None:
+        return {"anomaly_score": 0.0, "anomaly": False}
+    try:
+        fv = np.array(feature_vector).reshape(1, -1)
+        fv_scaled = scaler.transform(fv)
+        score = -isof.decision_function(fv_scaled)[0]  # map so higher = more anomalous
+        anomaly = (score >= ANOMALY_THRESHOLD)
+        return {"anomaly_score": float(score), "anomaly": bool(anomaly)}
+    except Exception:
+        return {"anomaly_score": 0.0, "anomaly": False}
 
-    # API rate abuse
-    cnt = count_ip_requests(ip)
-    if cnt > API_RATE_THRESHOLD:
-        alerts.append(("api_rate_abuse", f"{cnt} reqs in last {API_RATE_WINDOW_S}s"))
+def severity_from_logic(sig_hits, anomaly_info, behavior):
+    # Priority: signature hits > behavioral thresholds > anomaly score
+    if sig_hits:
+        # map certain signatures to severity
+        if "jndi_like" in sig_hits or "ssrf_ip" in sig_hits or "sensitive_file" in sig_hits:
+            return "critical"
+        if "sql_injection" in sig_hits or "xss" in sig_hits or "path_traversal" in sig_hits:
+            return "high"
+        return "medium"
+    # behavioral
+    if behavior["count_1m"] >= RATE_THRESHOLD_PER_MIN:
+        return "high"
+    if behavior["failed_5m"] >= FAILED_LOGIN_THRESHOLD:
+        return "high"
+    if anomaly_info["anomaly"]:
+        # map anomaly score to severity
+        s = anomaly_info["anomaly_score"]
+        if s > 2.0:
+            return "high"
+        if s > 1.0:
+            return "medium"
+        return "low"
+    return "none"
 
-    # brute force: detect repeated failed auths (status 401 or 403)
-    if parsed.get("status") in (401, 403):
-        add_ip_failure(ip)
-        fails = count_ip_failures(ip)
-        if fails >= BRUTE_FORCE_FAILS_THRESHOLD:
-            alerts.append(("brute_force", f"{fails} failed auths in {BRUTE_FORCE_WINDOW_S}s"))
-
-    # many distinct user agents from same IP in short period -> potential credential stuffing / bot farm
-    variety = ua_variety(ip)
-    if variety >= IP_USERAGENT_VARIETY_THRESHOLD:
-        alerts.append(("ua_variety", f"{variety} distinct user agents in recent window"))
-
-    return alerts
-
-def parse_log_line(line: str):
-    """
-    Try to parse common fields: ip, datetime, method, path, protocol, status, size, user-agent if present.
-    Returns dict with fields (some optional).
-    """
-    parsed = {}
-    # IP
-    m_ip = re.match(r"^\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+", line)
-    if m_ip:
-        parsed["ip"] = m_ip.group(1)
-    else:
-        parsed["ip"] = "0.0.0.0"
-
-    # status and size
-    m_status = re.search(r'"\s*(\d{3})\s+(\d+)', line)
-    if m_status:
-        parsed["status"] = int(m_status.group(1))
-        parsed["size"] = int(m_status.group(2))
-    else:
-        parsed["status"] = None
-        parsed["size"] = None
-
-    # method and path inside quotes ("GET /path HTTP/1.1")
-    m_req = re.search(r'\"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([^"]+?)\s+HTTP/[\d\.]+"', line)
-    if m_req:
-        parsed["method"] = m_req.group(1)
-        parsed["path"] = m_req.group(2)
-    else:
-        # fallbacks
-        parsed["method"] = None
-        parsed["path"] = None
-
-    # user-agent (very naive)
-    m_ua = re.search(r'\"[^\"]*\"\s*\"([^\"]+)\"$', line)
-    if m_ua:
-        parsed["user_agent"] = m_ua.group(1)
-    else:
-        parsed["user_agent"] = None
-
-    return parsed
+def log_detection(d):
+    try:
+        Path(LOG_OUTPUT).parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_OUTPUT, "a") as f:
+            f.write(json.dumps(d) + "\n")
+    except Exception:
+        pass
 
 @app.route("/", methods=["POST"])
-def analyze_log():
-    try:
-        if not request.is_json:
-            return jsonify({"status": "Error", "message": "Content-Type must be application/json"}), 400
-        payload = request.get_json()
-        if not payload or "log_line" not in payload:
-            return jsonify({"status": "Error", "message": "JSON must contain 'log_line' field"}), 400
-
+def ingest():
+    payload = request.get_json(force=True, silent=True)
+    if payload and isinstance(payload, dict) and "log_line" in payload:
         line = payload["log_line"]
-        # detect signaures
-        sigs = detect_signatures(line)
-        parsed = parse_log_line(line)
-        ip = parsed.get("ip", "0.0.0.0")
+    else:
+        # accept raw text body
+        line = request.get_data(as_text=True) or ""
+    fields = extract_basic_fields(line)
+    ip = fields["ip"] or "0.0.0.0"
+    ts = fields["ts"]
+    path = fields["path"] or "/"
+    status = fields.get("status", 0)
+    text = fields.get("text", line)
 
-        behavior_alerts = detect_behavior(ip, parsed)
+    # update behavior state
+    add_request(ip, ts, path, status)
+    behavior = compute_behavioral_features(ip)
 
-        # ML anomaly scoring
-        anomaly = None
-        anomaly_score = None
-        try:
-            if isof is not None:
-                vec = vectorize_for_model(line).reshape(1, -1)
-                # IsolationForest: decision_function higher means more normal -> negative means anomaly depending on sklearn version
-                # But we'll use scoring: lower => more anomalous
-                score = float(isof.decision_function(vec)[0])
-                anomaly_score = score
-                # Convert to intuitive anomaly flag (custom threshold)
-                if score < ANOMALY_SCORE_THRESHOLD:
-                    anomaly = True
-                else:
-                    anomaly = False
-        except Exception:
-            logger.exception("ML scoring failed")
+    # signature scan
+    sig_hits = signature_scan(text + " " + (fields.get("user_agent") or ""))
 
-        alerts = []
-        severity = "None"
+    # text feature
+    text_feat = make_text_feature(text + " " + (fields.get("user_agent") or ""))
+    # numeric features
+    numeric = np.array([behavior["count_1m"], behavior["failed_5m"], behavior["unique_paths_1m"], int(status)])
+    # assemble feature vector
+    fv = np.hstack([numeric, text_feat]).astype(float)
 
-        # Collect signature alerts (map to severity)
-        if sigs:
-            alerts.extend([{"type": s, "source": "signature"} for s in sigs]
-                          )
-            # if we detected critical signatures, raise severity
-            if any(s in ("rce_cmd", "log4shell", "lfi") for s in sigs):
-                severity = "High"
-            else:
-                severity = "Medium"
+    anomaly_info = predict_anomaly(fv)
+    severity = severity_from_logic(sig_hits, anomaly_info, behavior)
 
-        # behavior alerts
-        if behavior_alerts:
-            alerts.extend([{"type": a[0], "source": "behavior", "detail": a[1]} for a in behavior_alerts])
-            if any(a[0] == "brute_force" for a in behavior_alerts):
-                severity = "High"
-            else:
-                if severity != "High":
-                    severity = "Medium"
+    detection = {
+        "ip": ip,
+        "timestamp": datetime.utcfromtimestamp(ts).isoformat() + "Z",
+        "path": path,
+        "status": status,
+        "signature_hits": sig_hits,
+        "anomaly_score": anomaly_info["anomaly_score"],
+        "anomaly_flag": anomaly_info["anomaly"],
+        "behavior": behavior,
+        "severity": severity,
+    }
 
-        # ML anomaly
-        if anomaly is True:
-            alerts.append({"type": "anomaly_ml", "source": "ml", "score": anomaly_score})
-            if severity != "High":
-                severity = "Medium"
+    # log detection
+    log_detection(detection)
 
-        # If no alerts: normal
-        if not alerts:
-            return jsonify({"status": "Log analyzed. Traffic is normal."})
-
-        out = {
-            "status": "Attack Detected",
-            "severity": severity,
-            "alerts": alerts,
-            "ip": ip,
-            "raw": line
-        }
-        return jsonify(out)
-    except Exception as e:
-        logger.exception("Unhandled exception in analyze_log")
-        return jsonify({"status": "Error", "message": str(e), "trace": traceback.format_exc()}), 500
+    if severity == "none":
+        return jsonify({"status": "Log analyzed. Traffic is normal."})
+    else:
+        # map severity to suggested type
+        return jsonify({"status": "Attack Detected", "type": ", ".join(sig_hits) or "Anomalous", "severity": severity, **detection})
 
 if __name__ == "__main__":
-    # GCP will set $PORT; for local debug set FLASK_DEBUG=1 and run with python main.py
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=False)
