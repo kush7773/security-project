@@ -1,2 +1,1 @@
-web: functions-framework --target=log_ingestion_api --signature-type=http --port $PORT
-
+web: gunicorn main:app --bind 0.0.0.0:$PORT --workers 4 --threads 2

@@ -1,280 +1,408 @@
 # main.py
-import functions_framework
-from google.cloud import storage, firestore
-import joblib
 import os
 import re
-import urllib.parse
-import uuid
-import json
 import time
+import json
+import math
+import joblib
+import logging
+import traceback
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
-# --- CONFIG ---
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'siem-logs-kush-unique')
-MODEL_PATH = os.environ.get('MODEL_PATH', 'isolation_forest.joblib')
-VECTORIZER_PATH = os.environ.get('VECTORIZER_PATH', 'tfidf_vectorizer.joblib')
+from flask import Flask, request, jsonify
 
-# thresholds (tune these)
-BRUTE_FORCE_WINDOW_SECONDS = 60 * 5   # 5 minutes
-BRUTE_FORCE_THRESHOLD = 10            # 10 failed logins in window => brute force
-API_ABUSE_WINDOW_SECONDS = 60         # 1 minute
-API_ABUSE_THRESHOLD = 50              # 50 requests to same endpoint from same IP in window
+import numpy as np
 
-# initialize google clients
-db = firestore.Client()
-storage_client = storage.Client()
-
-# load ML models (if present)
-ML_MODEL = None
-VECTORIZER = None
+# Optional Redis support (recommended for multi-instance deployments)
 try:
-    print("Loading ML model and vectorizer...")
-    if os.path.exists(MODEL_PATH):
-        ML_MODEL = joblib.load(MODEL_PATH)
-    if os.path.exists(VECTORIZER_PATH):
-        VECTORIZER = joblib.load(VECTORIZER_PATH)
-    print("Model load attempted. ML_MODEL:", bool(ML_MODEL), "VECTORIZER:", bool(VECTORIZER))
-except Exception as e:
-    print("Warning: could not load ML model/vectorizer:", e)
-    ML_MODEL = None
-    VECTORIZER = None
+    import redis
+except Exception:
+    redis = None
 
-# --- SIGNATURE RULES (expand as needed) ---
-SIGNATURE_RULES = {
-    # SQLi (basic patterns)
-    "SQL_INJECTION": r"(?:(\%27|')\s*(?:or|and)\s*(?:\%27|')?\s*\d+\s*=\s*\d+|union\s+select|--\s|/\*|\*/|drop\s+table)",
-    # XSS
-    "XSS_SCRIPTING": r"(<\s*script\b|%3Cscript%3E|onerror=|onload=|<img\s+src=)",
-    # Command injection
-    "COMMAND_INJECTION": r"(\b(cat|ls|whoami|wget|curl|nc|nmap|bash|sh)\b|\;|\$\(|\`|\|)",
-    # Local/Remote File Inclusion
-    "LFI_RFI": r"(\.\./\.\.|etc/passwd|file=\/|include_path=|php://filter|data:php)",
-    # SSRF common patterns (http:// followed by private/external addresses)
-    "SSRF": r"(http:\/\/|https:\/\/)(localhost|127\.0\.0\.1|169\.254|0\.0\.0\.0|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})",
-    # Log4Shell / JNDI (Log4j exploitation strings)
-    "LOG4SHELL": r"\$\{jndi:(?:ldap|rmi|dns|iiop|corba):\/\/[^\}\s]+\}",
-    # LDAP/JNDI attempts encoded
-    "LOG4SHELL_ENCODED": r"(%24%7Bjndi:|%24%7Bjndi%3A)(ldap|rmi|dns)",
-    # Path traversal
-    "PATH_TRAVERSAL": r"(\.\./\.\.|%2e%2e%2f|%2e%2e/)",
-    # Common webshell probes (php eval etc)
-    "WEBSHELL": r"(eval\(|base64_decode\(|system\(|passthru\(|exec\(|assert\()",
+# --- Configuration ---
+PORT = int(os.environ.get("PORT", "8080"))
+REDIS_URL = os.environ.get("REDIS_URL")  # e.g. redis://:password@host:6379/0
+USE_REDIS = (redis is not None) and (REDIS_URL is not None)
+
+# Thresholds (tune these for your environment)
+BRUTE_FORCE_WINDOW_S = 60 * 5         # 5 minutes
+BRUTE_FORCE_FAILS_THRESHOLD = 10      # e.g., 10 failed logins in window -> suspicious
+API_RATE_WINDOW_S = 60                # per minute
+API_RATE_THRESHOLD = 120              # requests per minute -> API abuse
+ANOMALY_SCORE_THRESHOLD = 0.5         # lower => more sensitive (IsolationForest gives negative/positive/score)
+IP_USERAGENT_VARIETY_THRESHOLD = 10   # too many different UA's from same IP in short time
+SUSPICIOUS_PAYLOAD_ENTROPY = 4.0
+
+# Model file locations (pretrained)
+TFIDF_PATH = os.environ.get("TFIDF_PATH", "tfidf_vectorizer.joblib")
+PCA_PATH = os.environ.get("PCA_PATH", "pca.joblib")  # optional if you used PCA
+IF_PATH = os.environ.get("IF_PATH", "isolation_forest.joblib")
+SCALER_PATH = os.environ.get("SCALER_PATH", "scaler.joblib")
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("secapp")
+
+app = Flask(__name__)
+
+# Persistent stores (Redis-backed if configured)
+if USE_REDIS:
+    r = redis.from_url(REDIS_URL)
+else:
+    r = None
+    # In-memory fallback (not shared across instances)
+    ip_failures = defaultdict(deque)      # ip -> deque of fail timestamps
+    ip_requests = defaultdict(deque)      # ip -> deque of request timestamps
+    ip_useragents = defaultdict(lambda: defaultdict(int))  # ip -> ua -> count
+    recent_events = deque(maxlen=10000)
+
+# --- Signature regexes (simplified / extend these) ---
+SIG_REGEXES = {
+    "sql_injection": re.compile(r"(?i)\b(union(\s+all)?\s+select|or\s+1=1|--\s|#\s|/\*.*\*/|sleep\(|benchmark\()", re.IGNORECASE),
+    "xss": re.compile(r"(?i)(<script\b|javascript:|onerror=|onload=|%3Cscript%3E)"),
+    "path_traversal": re.compile(r"(\.\./|\.\.\\)"),
+    "lfi": re.compile(r"(?i)(etc/passwd|proc/self/environ|/etc/shadow)"),
+    "rce_cmd": re.compile(r"(?i)(;|\|\||\&\&|\$(\(|\{)|`.*`)\s*(curl|wget|nc|bash|sh)\b"),
+    "log4shell": re.compile(r"(?i)\$\{jndi:(ldap|rmi|dns|iiop|corba):\/\/[^\s\}]+\}"),
+    "ssrf": re.compile(r"(?i)http:\/\/127\.0\.0\.1|http:\/\/localhost|http:\/\/169\.254\.169\.254"),
+    "file_upload_malicious": re.compile(r"(?i)\.(php|phtml|jsp|asp|aspx|exe|sh)$"),
+    # Add more rules as you need...
 }
 
-# regexp to parse common log format: IP - - [time] "REQUEST" status size
-LOG_PATTERN = re.compile(r'(\d{1,3}(?:\.\d{1,3}){3}) - .*?"(.*?)" (\d{3})')
+# Helper: compute entropy of a string
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    probs = [float(s.count(c)) / len(s) for c in set(s)]
+    return -sum(p * math.log2(p) for p in probs if p > 0)
 
-def _firestore_increment_counter(collection, doc_id, field, increment=1, extra_update=None):
-    """Atomic increment with expiry metadata for counters used in detection."""
-    doc_ref = db.collection(collection).document(doc_id)
-    now = firestore.SERVER_TIMESTAMP
-    def txn_func(txn):
-        snapshot = doc_ref.get(transaction=txn)
-        if snapshot.exists:
-            data = snapshot.to_dict()
-            # If stored timestamp is older than window, reset counter
-            # We'll keep client-side windowing check as well.
-            txn.update(doc_ref, {field: firestore.Increment(increment), 'last_seen': now})
-        else:
-            doc_data = {field: increment, 'first_seen': now, 'last_seen': now}
-            if extra_update:
-                doc_data.update(extra_update)
-            txn.set(doc_ref, doc_data)
+# --- Model loading (if present) ---
+tfidf = None
+pca = None
+isof = None
+scaler = None
+
+def safe_load_models():
+    global tfidf, pca, isof, scaler
     try:
-        db.run_transaction(txn_func)
-    except Exception as e:
-        print("Firestore counter increment error:", e)
-
-def check_brute_force(ip, endpoint, is_failed_login):
-    """Track failed logins per IP (and per endpoint optionally) in Firestore."""
-    # doc id per IP (you can also use per-ip+endpoint)
-    doc_id = f"bf::{ip}"
-    if is_failed_login:
-        _firestore_increment_counter("BruteForceCounters", doc_id, "failed_count", increment=1,
-                                    extra_update={"last_endpoint": endpoint})
-    # read recent counters and decide
-    doc_ref = db.collection("BruteForceCounters").document(doc_id)
-    try:
-        doc = doc_ref.get()
-        if not doc.exists:
-            return False, 0
-        data = doc.to_dict()
-        failed = data.get("failed_count", 0)
-        # Simple approach: if failed_count >= threshold => alert
-        if failed >= BRUTE_FORCE_THRESHOLD:
-            return True, failed
-        return False, failed
-    except Exception as e:
-        print("Error reading brute force counters:", e)
-        return False, 0
-
-def check_api_abuse(ip, endpoint):
-    """Track per-ip endpoint requests rate. Store small window counts in Firestore."""
-    # doc key per ip+endpoint
-    safe_endpoint = re.sub(r'[^0-9A-Za-z_\-]', '_', endpoint)[:200]
-    doc_id = f"api::{ip}::{safe_endpoint}"
-    _firestore_increment_counter("APIRequestCounters", doc_id, "count", increment=1)
-    doc_ref = db.collection("APIRequestCounters").document(doc_id)
-    try:
-        doc = doc_ref.get()
-        if not doc.exists:
-            return False, 0
-        data = doc.to_dict()
-        cnt = data.get("count", 0)
-        if cnt >= API_ABUSE_THRESHOLD:
-            return True, cnt
-        return False, cnt
-    except Exception as e:
-        print("API abuse counter read error:", e)
-        return False, 0
-
-def analyze_log_line(log_line):
-    """
-    Returns: (detected_type, severity, ip, meta)
-    meta is a dict with helpful debugging info.
-    """
-    meta = {}
-    # parse
-    match = re.search(LOG_PATTERN, log_line)
-    if not match:
-        return "NOT_PARSEABLE", "None", "0.0.0.0", {"raw": log_line}
-
-    ip = match.group(1)
-    request_details = match.group(2)  # e.g. GET /path?foo=bar HTTP/1.1
-    status = match.group(3)
-    meta['request_raw'] = request_details
-    # decode URL encoded content
-    try:
-        decoded = urllib.parse.unquote_plus(request_details)
+        if os.path.exists(TFIDF_PATH):
+            tfidf = joblib.load(TFIDF_PATH)
+            logger.info("Loaded TF-IDF vectorizer.")
     except Exception:
-        decoded = request_details
-    meta['request_decoded'] = decoded
+        logger.exception("Failed to load TF-IDF.")
 
-    detected = "Normal"
-    severity = "None"
-
-    # Split out method and path
-    method = None
-    path = decoded
     try:
-        parts = decoded.split()
-        if len(parts) >= 2:
-            method = parts[0]
-            path = parts[1]
+        if os.path.exists(PCA_PATH):
+            pca = joblib.load(PCA_PATH)
+            logger.info("Loaded PCA.")
     except Exception:
-        pass
-    meta['method'] = method
-    meta['path'] = path
-    # 1) Signature-based detection: check expanded rules
-    for name, pattern in SIGNATURE_RULES.items():
-        try:
-            if re.search(pattern, decoded, re.IGNORECASE):
-                detected = name
-                severity = "High" if name not in ("LOG4SHELL", "LOG4SHELL_ENCODED") else "Critical"
-                meta['signature_pattern'] = pattern
-                break
-        except re.error:
-            continue
+        logger.info("No PCA loaded (optional).")
 
-    # 2) Behavioral detections
-    # Brute-force: consider 401/403 responses or login endpoint patterns
-    is_failed_login = False
-    st = int(status) if status and status.isdigit() else 0
-    if st in (401, 403):
-        is_failed_login = True
-    # also heuristics for login paths
-    if re.search(r"/auth|/login|/signin|/wp-login.php", path, re.IGNORECASE):
-        # treat 401/403 as failed login; else count attempts too
-        if st in (401, 403):
-            is_failed_login = True
-
-    if is_failed_login:
-        bf_alert, bf_count = check_brute_force(ip, path, True)
-        meta['brute_failed_count'] = bf_count
-        if bf_alert:
-            detected = "BRUTE_FORCE"
-            severity = "High"
-
-    # API abuse: high request rate to same endpoint
-    abuse_alert, abuse_count = check_api_abuse(ip, path)
-    meta['api_request_count'] = abuse_count
-    if abuse_alert:
-        detected = "API_ABUSE"
-        severity = "High"
-
-    # 3) ML Anomaly detection (zero-day) if still normal
-    if detected == "Normal" and ML_MODEL and VECTORIZER:
-        try:
-            # we use the decoded request string as feature; consider adding UA/headers later
-            features = VECTORIZER.transform([decoded])
-            pred = ML_MODEL.predict(features)  # IsolationForest -> -1 is anomaly
-            if hasattr(pred, "__len__") and pred[0] == -1:
-                detected = "ML_ANOMALY_ZERO_DAY"
-                severity = "Critical"
-                meta['ml_pred'] = int(pred[0])
-        except Exception as e:
-            meta['ml_error'] = str(e)
-
-    meta['detected_after'] = datetime.utcnow().isoformat() + "Z"
-    return detected, severity, ip, meta
-
-def persist_alert(detected_type, severity, ip, log_line, meta):
-    """Store raw log + structured alert into Cloud Storage + Firestore"""
-    event_id = str(uuid.uuid4())
-    # Save raw log to bucket
     try:
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(f"raw-logs/{event_id}.log")
-        blob.upload_from_string(log_line)
-    except Exception as e:
-        print("Storage upload error:", e)
-    # Save structured alert to Firestore
+        if os.path.exists(IF_PATH):
+            isof = joblib.load(IF_PATH)
+            logger.info("Loaded IsolationForest.")
+    except Exception:
+        logger.exception("Failed to load IsolationForest.")
+
     try:
-        doc_ref = db.collection("DetectedAttacks").document(event_id)
-        doc_ref.set({
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "ip": ip,
-            "type": detected_type,
-            "severity": severity,
-            "raw_log": log_line,
-            "meta": meta,
-            "status": "Logged"
-        })
-    except Exception as e:
-        print("Firestore save alert error:", e)
+        if os.path.exists(SCALER_PATH):
+            scaler = joblib.load(SCALER_PATH)
+            logger.info("Loaded scaler.")
+    except Exception:
+        logger.info("No scaler loaded (optional).")
 
-@functions_framework.http
-def log_ingestion_api(request):
+
+safe_load_models()
+
+# --- Rate/behavior helpers ---
+def now_ts():
+    return int(time.time())
+
+def add_ip_failure(ip):
+    t = now_ts()
+    if r:
+        key = f"fail:{ip}"
+        r.lpush(key, t)
+        r.expire(key, BRUTE_FORCE_WINDOW_S + 10)
+    else:
+        dq = ip_failures[ip]
+        dq.append(t)
+        # prune old
+        cutoff = t - BRUTE_FORCE_WINDOW_S
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+def count_ip_failures(ip):
+    t = now_ts()
+    if r:
+        key = f"fail:{ip}"
+        return r.llen(key)
+    else:
+        dq = ip_failures[ip]
+        cutoff = t - BRUTE_FORCE_WINDOW_S
+        return sum(1 for ts in dq if ts >= cutoff)
+
+def add_ip_request(ip):
+    t = now_ts()
+    if r:
+        key = f"req:{ip}"
+        r.lpush(key, t)
+        r.expire(key, API_RATE_WINDOW_S + 10)
+    else:
+        dq = ip_requests[ip]
+        dq.append(t)
+        cutoff = t - API_RATE_WINDOW_S
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+def count_ip_requests(ip):
+    t = now_ts()
+    if r:
+        key = f"req:{ip}"
+        return r.llen(key)
+    else:
+        dq = ip_requests[ip]
+        cutoff = t - API_RATE_WINDOW_S
+        return sum(1 for ts in dq if ts >= cutoff)
+
+def add_useragent(ip, ua):
+    t = now_ts()
+    if r:
+        key = f"ua:{ip}"
+        r.hincrby(key, ua, 1)
+        r.expire(key, API_RATE_WINDOW_S * 10)
+    else:
+        ip_useragents[ip][ua] += 1
+
+def ua_variety(ip):
+    if r:
+        key = f"ua:{ip}"
+        return len(r.hgetall(key))
+    else:
+        return len(ip_useragents[ip])
+
+# --- Feature extraction for ML ---
+def extract_features_from_log(line: str):
     """
-    Cloud Function-style HTTP entrypoint used via functions-framework.
-    Expects JSON body: {"log_line": "..."}
+    Return a combined numeric feature vector for the log_line.
     """
-    if request.method != 'POST':
-        return ('Method Not Allowed', 405)
+    # Basic numeric features
+    features = {}
+    features["len"] = len(line)
+    features["entropy"] = shannon_entropy(line)
+    features["digit_ratio"] = sum(ch.isdigit() for ch in line) / max(1, len(line))
+    features["nonalnum_ratio"] = sum(not ch.isalnum() for ch in line) / max(1, len(line))
+    # status code / response size extraction if present in typical log format
+    # Try to parse "HTTP status" and "size" patterns
+    m = re.search(r'"\s*(\d{3})\s+(\d+)', line)
+    if m:
+        features["status"] = int(m.group(1))
+        features["size"] = int(m.group(2))
+    else:
+        features["status"] = 0
+        features["size"] = 0
+    return features
 
-    data = request.get_json(silent=True)
-    if not data or 'log_line' not in data:
-        return ('Missing "log_line" in request body', 400)
-
-    log_line = data['log_line']
-    print("Received log:", log_line)
-    detected, severity, ip, meta = analyze_log_line(log_line)
-
-    # If an attack detected, persist alert
-    if detected != "Normal" and detected != "NOT_PARSEABLE":
+def vectorize_for_model(line: str):
+    """
+    Returns a 1D numpy array feature vector combining numeric features + TF-IDF reduced.
+    """
+    numeric = extract_features_from_log(line)
+    numeric_arr = np.array([numeric["len"], numeric["entropy"], numeric["digit_ratio"],
+                            numeric["nonalnum_ratio"], numeric["status"], numeric["size"]],
+                           dtype=float).reshape(1, -1)
+    # TF-IDF part
+    tfidf_part = None
+    if tfidf is not None:
         try:
-            persist_alert(detected, severity, ip, log_line, meta)
-        except Exception as e:
-            print("Error persisting alert:", e)
-        resp = {
+            tf = tfidf.transform([line])
+            if pca is not None:
+                tf_reduced = pca.transform(tf.toarray())
+            else:
+                # if no PCA, reduce by taking top-k features (or average) -> keep small
+                tf_reduced = tf.toarray()
+            tfidf_part = tf_reduced
+        except Exception:
+            logger.exception("tfidf transform failed.")
+            tfidf_part = None
+
+    if tfidf_part is not None:
+        # align shapes (if tf_reduced has many dims, try to reduce to something manageable)
+        # If tfidf_part has shape (1, n), we can concatenante
+        try:
+            combined = np.hstack([numeric_arr, tfidf_part])
+        except Exception:
+            # fallback: just use numeric
+            combined = numeric_arr
+    else:
+        combined = numeric_arr
+
+    if scaler is not None:
+        try:
+            combined = scaler.transform(combined)
+        except Exception:
+            pass
+
+    return combined.ravel()
+
+# --- Detection pipeline ---
+def detect_signatures(line: str):
+    matches = []
+    for name, rx in SIG_REGEXES.items():
+        if rx.search(line):
+            matches.append(name)
+    return matches
+
+def detect_behavior(ip: str, parsed):
+    """
+    parsed: dict containing parsed fields like path, status, method, user_agent etc.
+    returns list of behavioral alerts
+    """
+    alerts = []
+    add_ip_request(ip)
+    add_useragent(ip, parsed.get("user_agent", "unknown"))
+
+    # API rate abuse
+    cnt = count_ip_requests(ip)
+    if cnt > API_RATE_THRESHOLD:
+        alerts.append(("api_rate_abuse", f"{cnt} reqs in last {API_RATE_WINDOW_S}s"))
+
+    # brute force: detect repeated failed auths (status 401 or 403)
+    if parsed.get("status") in (401, 403):
+        add_ip_failure(ip)
+        fails = count_ip_failures(ip)
+        if fails >= BRUTE_FORCE_FAILS_THRESHOLD:
+            alerts.append(("brute_force", f"{fails} failed auths in {BRUTE_FORCE_WINDOW_S}s"))
+
+    # many distinct user agents from same IP in short period -> potential credential stuffing / bot farm
+    variety = ua_variety(ip)
+    if variety >= IP_USERAGENT_VARIETY_THRESHOLD:
+        alerts.append(("ua_variety", f"{variety} distinct user agents in recent window"))
+
+    return alerts
+
+def parse_log_line(line: str):
+    """
+    Try to parse common fields: ip, datetime, method, path, protocol, status, size, user-agent if present.
+    Returns dict with fields (some optional).
+    """
+    parsed = {}
+    # IP
+    m_ip = re.match(r"^\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+", line)
+    if m_ip:
+        parsed["ip"] = m_ip.group(1)
+    else:
+        parsed["ip"] = "0.0.0.0"
+
+    # status and size
+    m_status = re.search(r'"\s*(\d{3})\s+(\d+)', line)
+    if m_status:
+        parsed["status"] = int(m_status.group(1))
+        parsed["size"] = int(m_status.group(2))
+    else:
+        parsed["status"] = None
+        parsed["size"] = None
+
+    # method and path inside quotes ("GET /path HTTP/1.1")
+    m_req = re.search(r'\"(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([^"]+?)\s+HTTP/[\d\.]+"', line)
+    if m_req:
+        parsed["method"] = m_req.group(1)
+        parsed["path"] = m_req.group(2)
+    else:
+        # fallbacks
+        parsed["method"] = None
+        parsed["path"] = None
+
+    # user-agent (very naive)
+    m_ua = re.search(r'\"[^\"]*\"\s*\"([^\"]+)\"$', line)
+    if m_ua:
+        parsed["user_agent"] = m_ua.group(1)
+    else:
+        parsed["user_agent"] = None
+
+    return parsed
+
+@app.route("/", methods=["POST"])
+def analyze_log():
+    try:
+        if not request.is_json:
+            return jsonify({"status": "Error", "message": "Content-Type must be application/json"}), 400
+        payload = request.get_json()
+        if not payload or "log_line" not in payload:
+            return jsonify({"status": "Error", "message": "JSON must contain 'log_line' field"}), 400
+
+        line = payload["log_line"]
+        # detect signaures
+        sigs = detect_signatures(line)
+        parsed = parse_log_line(line)
+        ip = parsed.get("ip", "0.0.0.0")
+
+        behavior_alerts = detect_behavior(ip, parsed)
+
+        # ML anomaly scoring
+        anomaly = None
+        anomaly_score = None
+        try:
+            if isof is not None:
+                vec = vectorize_for_model(line).reshape(1, -1)
+                # IsolationForest: decision_function higher means more normal -> negative means anomaly depending on sklearn version
+                # But we'll use scoring: lower => more anomalous
+                score = float(isof.decision_function(vec)[0])
+                anomaly_score = score
+                # Convert to intuitive anomaly flag (custom threshold)
+                if score < ANOMALY_SCORE_THRESHOLD:
+                    anomaly = True
+                else:
+                    anomaly = False
+        except Exception:
+            logger.exception("ML scoring failed")
+
+        alerts = []
+        severity = "None"
+
+        # Collect signature alerts (map to severity)
+        if sigs:
+            alerts.extend([{"type": s, "source": "signature"} for s in sigs]
+                          )
+            # if we detected critical signatures, raise severity
+            if any(s in ("rce_cmd", "log4shell", "lfi") for s in sigs):
+                severity = "High"
+            else:
+                severity = "Medium"
+
+        # behavior alerts
+        if behavior_alerts:
+            alerts.extend([{"type": a[0], "source": "behavior", "detail": a[1]} for a in behavior_alerts])
+            if any(a[0] == "brute_force" for a in behavior_alerts):
+                severity = "High"
+            else:
+                if severity != "High":
+                    severity = "Medium"
+
+        # ML anomaly
+        if anomaly is True:
+            alerts.append({"type": "anomaly_ml", "source": "ml", "score": anomaly_score})
+            if severity != "High":
+                severity = "Medium"
+
+        # If no alerts: normal
+        if not alerts:
+            return jsonify({"status": "Log analyzed. Traffic is normal."})
+
+        out = {
             "status": "Attack Detected",
-            "type": detected,
             "severity": severity,
+            "alerts": alerts,
             "ip": ip,
-            "meta": meta
+            "raw": line
         }
-        return (json.dumps(resp), 200, {'Content-Type': 'application/json'})
+        return jsonify(out)
+    except Exception as e:
+        logger.exception("Unhandled exception in analyze_log")
+        return jsonify({"status": "Error", "message": str(e), "trace": traceback.format_exc()}), 500
 
-    # For normal logs, return a simple message
-    return (json.dumps({"status": "Log analyzed. Traffic is normal."}), 200, {'Content-Type': 'application/json'})
+if __name__ == "__main__":
+    # GCP will set $PORT; for local debug set FLASK_DEBUG=1 and run with python main.py
+    app.run(host="0.0.0.0", port=PORT)

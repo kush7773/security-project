@@ -1,78 +1,129 @@
 # train_model.py
-# This script reads the clean log file, trains the ML model, 
-# and saves the models to disk for the API to use.
-
-import re
-import joblib
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import IsolationForest
-import sys
 import os
+import sys
+import re
+import argparse
+import logging
+from collections import Counter
+import math
+import joblib
 
-# --- CONFIGURATION ---
-CLEAN_LOG_FILE = "clean_access.log"
-MODEL_FILE = "isolation_forest.joblib"
-VECTORIZER_FILE = "tfidf_vectorizer.joblib"
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
 
-log_pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) - .*?"(.*?)" (\d{3})')
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("train_model")
 
-def load_and_parse_logs():
-    """Loads the clean log file and extracts the request part."""
-    
-    # Check if we have the necessary clean log file
-    if not os.path.exists(CLEAN_LOG_FILE):
-        print(f"[FATAL ERROR] Clean log file not found: {CLEAN_LOG_FILE}")
-        print("Please copy your clean log from the victim server first.")
-        return None
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    probs = [float(s.count(c)) / len(s) for c in set(s)]
+    return -sum(p * math.log2(p) for p in probs if p > 0)
 
-    print(f"[*] Loading clean log file: {CLEAN_LOG_FILE}...")
-    requests = []
-    try:
-        with open(CLEAN_LOG_FILE, 'r') as f:
-            for line in f:
-                match = log_pattern.match(line)
-                if match:
-                    request_details = match.group(2)
-                    requests.append(request_details)
-        
-        if not requests:
-            print("[ERROR] No valid log lines found. Aborting.")
-            return None
+def extract_numeric_features(line: str):
+    """Return numeric feature vector for a log line."""
+    ln = len(line)
+    ent = shannon_entropy(line)
+    digit_ratio = sum(ch.isdigit() for ch in line) / max(1, ln)
+    nonalnum_ratio = sum(not ch.isalnum() for ch in line) / max(1, ln)
+    # status/size
+    m = re.search(r'"\s*(\d{3})\s+(\d+)', line)
+    status = int(m.group(1)) if m else 0
+    size = int(m.group(2)) if m else 0
+    return [ln, ent, digit_ratio, nonalnum_ratio, status, size]
 
-        print(f"[*] Found {len(requests)} normal requests to train on.")
-        return requests
-        
-    except Exception as e:
-        print(f"[FATAL ERROR] Could not read log file: {e}")
-        return None
+def load_lines(paths, max_lines=None):
+    lines = []
+    for p in paths:
+        with open(p, "r", errors="ignore") as fh:
+            for i, ln in enumerate(fh):
+                if max_lines and len(lines) >= max_lines:
+                    break
+                ln = ln.strip()
+                if ln:
+                    lines.append(ln)
+    return lines
 
-def train_and_save_models(requests):
-    """Trains the Vectorizer and Isolation Forest model."""
-    if not requests:
-        print("[ERROR] No requests to train on. Aborting.")
-        return
+def safe_n_components(requested, n_samples, n_features):
+    # At most n_samples - 1 for PCA with full svd (avoid singular error).
+    max_comp = max(1, min(n_samples - 1, n_features))
+    return min(requested, max_comp)
 
-    print("[*] Training TF-IDF vectorizer...")
-    # TF-IDF converts text to numerical features
-    vectorizer = TfidfVectorizer(max_features=1000)
-    features = vectorizer.fit_transform(requests)
-    
-    print("[*] Training Isolation Forest model...")
-    # Isolation Forest is unsupervised; fits model of 'normal' traffic
-    model = IsolationForest(contamination=0.01, random_state=42)
-    model.fit(features)
-    
-    # Save both models locally
-    print(f"[*] Saving models to {MODEL_FILE} and {VECTORIZER_FILE}...")
-    joblib.dump(vectorizer, VECTORIZER_FILE)
-    joblib.dump(model, MODEL_FILE)
-    
-    print("\n[SUCCESS] Models trained and saved successfully!")
+def main(args):
+    logger.info("Loading normal logs...")
+    normal_lines = load_lines(args.normal_logs, max_lines=args.max_lines)
+    n = len(normal_lines)
+    logger.info("Loaded %d normal lines", n)
+    if n < 5:
+        logger.warning("Very few normal lines (less than 5). Results may be unreliable.")
+
+    # TF-IDF training
+    logger.info("Training TF-IDF...")
+    tfidf = TfidfVectorizer(ngram_range=(1,2), max_features=2000, analyzer='char_wb')  # char_wb helps for payloads
+    tfidf_mat = tfidf.fit_transform(normal_lines)
+    logger.info("TF-IDF shaped: %s", tfidf_mat.shape)
+
+    # PCA on TF-IDF (optional)
+    # compute safe n_components
+    requested_pca = args.pca_dim
+    n_features = tfidf_mat.shape[1]
+    safe_pc = safe_n_components(requested_pca, n, n_features)
+    logger.info("Applying PCA to TF-IDF (safe n_components=%d)...", safe_pc)
+    pca = PCA(n_components=safe_pc)
+    # convert to array (should be OK within memory for moderate sizes)
+    tfidf_array = tfidf_mat.toarray()
+    tfidf_reduced = pca.fit_transform(tfidf_array)
+    logger.info("PCA applied, reduced shape: %s", tfidf_reduced.shape)
+
+    # Numeric features
+    logger.info("Extracting numeric features...")
+    numeric_feats = np.vstack([extract_numeric_features(ln) for ln in normal_lines])
+    logger.info("Numeric features shape: %s", numeric_feats.shape)
+
+    # Combine features
+    X = np.hstack([numeric_feats, tfidf_reduced])
+    logger.info("Combined feature matrix shape: %s", X.shape)
+
+    # Scale
+    logger.info("Fitting StandardScaler...")
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train IsolationForest
+    logger.info("Training IsolationForest...")
+    if args.if_estimators < 1:
+        args.if_estimators = 100
+    if_model = IsolationForest(n_estimators=args.if_estimators, contamination=args.contamination, random_state=42, n_jobs=-1)
+    if_model.fit(X_scaled)
+    logger.info("IsolationForest trained")
+
+    # Save models
+    os.makedirs(args.model_dir, exist_ok=True)
+    tfidf_path = os.path.join(args.model_dir, "tfidf_vectorizer.joblib")
+    pca_path = os.path.join(args.model_dir, "pca.joblib")
+    scaler_path = os.path.join(args.model_dir, "scaler.joblib")
+    if_path = os.path.join(args.model_dir, "isolation_forest.joblib")
+
+    logger.info("Saving models to %s", args.model_dir)
+    joblib.dump(tfidf, tfidf_path)
+    joblib.dump(pca, pca_path)
+    joblib.dump(scaler, scaler_path)
+    joblib.dump(if_model, if_path)
+    logger.info("Saved tfidf, pca, scaler, isolation forest.")
+
+    print("TRAINING COMPLETE")
+    print(f"Models saved at: {args.model_dir}")
 
 if __name__ == "__main__":
-    # Ensure you have a clean_access.log file before running this!
-    normal_requests = load_and_parse_logs()
-    if normal_requests:
-        train_and_save_models(normal_requests)
-    else:
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Train anomaly detection models from normal logs (for zero-day detection improvements).")
+    parser.add_argument("--normal_logs", nargs="+", required=True, help="Paths to clean/normal log files (space separated)")
+    parser.add_argument("--model_dir", default="./models", help="Directory to write models")
+    parser.add_argument("--max_lines", type=int, default=50000, help="Max number of lines to load from all logs")
+    parser.add_argument("--pca_dim", type=int, default=50, help="Requested PCA dimensions (will auto-adjust if too large)")
+    parser.add_argument("--if_estimators", type=int, default=100, help="Number of estimators for IsolationForest")
+    parser.add_argument("--contamination", type=float, default=0.01, help="Contamination parameter for IsolationForest")
+    args = parser.parse_args()
+    main(args)

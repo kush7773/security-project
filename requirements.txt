@@ -11,3 +11,5 @@ gunicorn
 Flask>=2.0
 regex
 pandas
+tensorflow>=2.0 
+tqdm
