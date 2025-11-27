@@ -1,16 +1,27 @@
-# Ignore all log files
-*.log
-*.log.*
-
-# Ignore training data
+# Ignore log datasets (training data)
+data/*.log
+data/normal*.log
+data/attack*.log
 data/normal_logs/
 data/attack_logs/
 
-# But DO NOT ignore models
-!/models/
-!/app/models/
+# Never track large raw logs again
+*.log
 
-# Ignore temporary files
+# Ignore Python cache
 __pycache__/
 *.pyc
-.env
+
+# Ignore virtual environment
+venv/
+env/
+
+# Ignore temporary files
+*.tmp
+*.swp
+
+# Ignore system files
+.DS_Store
+
+# Do NOT ignore the ML model directory
+# models/
