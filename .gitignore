@@ -1,0 +1,16 @@
+# Ignore all log files
+*.log
+*.log.*
+
+# Ignore training data
+data/normal_logs/
+data/attack_logs/
+
+# But DO NOT ignore models
+!/models/
+!/app/models/
+
+# Ignore temporary files
+__pycache__/
+*.pyc
+.env
